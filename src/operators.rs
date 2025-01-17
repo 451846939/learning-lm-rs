@@ -71,25 +71,197 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    todo!("实现 rms_norm，计算前做一些必要的检查会帮助你后续调试")
+    let shape = x.shape();
+    let last_dim = *shape.last().unwrap(); // 最后一个维度的大小
+    assert_eq!(
+        w.size(),
+        last_dim,
+        "Size of weight tensor must match the last dimension of input tensor"
+    );
+
+    let x_data = x.data();
+    let w_data = w.data();
+    let y_data = unsafe { y.data_mut() };
+
+    let batch_size = x.size() / last_dim;
+
+    for b in 0..batch_size {
+        let base = b * last_dim;
+
+        // 计算每个向量的均值平方根 (RMS)
+        let mean_square = (0..last_dim)
+            .map(|i| x_data[base + i].powi(2))
+            .sum::<f32>()
+            / last_dim as f32;
+        let rms = mean_square.sqrt().max(epsilon);
+
+        // 归一化并乘以权重
+        for i in 0..last_dim {
+            y_data[base + i] = (x_data[base + i] / rms) * w_data[i];
+        }
+    }
 }
 
 // y = silu(x) * y
 // hint: this is an element-wise operation
 pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
-    // let len = y.size();
-    // assert!(len == x.size());
+    let len = y.size();
+    assert!(len == x.size());
 
-    // let _y = unsafe { y.data_mut() };
-    // let _x = x.data();
+    let _y = unsafe { y.data_mut() };
+    let _x = x.data();
+    for i in 0..len {
+        _y[i] *= _x[i] / (1. + (-_x[i]).exp());
+    }
 
-    todo!("实现 silu，这里给了一些前期准备工作的提示，你可以参考")
 }
 
 // C = beta * C + alpha * A @ B^T
 // hint: You don't need to do an explicit transpose of B
 pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    todo!("实现 matmul_transb，计算前做一些必要的检查会帮助你后续调试");
+    let (m, k_a) = (a.shape()[0], a.shape()[1]); // A 的形状是 m x k_a
+    let (k_b, n) = (b.shape()[1], b.shape()[0]); // B 的形状是 n x k_b（转置后变为 k_b x n）
+    // 调试信息
+    // println!(
+    //     "Shape of A: {:?}, Shape of B: {:?}, Shape of C: {:?}",
+    //     a.shape(),
+    //     b.shape(),
+    //     c.shape()
+    // );
+    assert_eq!(k_a, k_b, "A 的列数应等于 B 转置的行数");
+    assert_eq!(c.shape()[0], m, "C 的行数应等于 A 的行数");
+    assert_eq!(c.shape()[1], n, "C 的列数应等于 B 的列数");
+
+    let a_data = a.data();
+    let b_data = b.data();
+    let c_data = unsafe { c.data_mut() };
+
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = 0.0;
+
+            // 计算 A 的第 i 行和 B 转置的第 j 行的点积
+            for k in 0..k_a {
+                // B 转置等价于访问 b[j][k]
+                sum += a_data[i * k_a + k] * b_data[j * k_b + k];
+            }
+
+            //  C[i][j]：beta * C[i][j] + alpha * sum
+            c_data[i * n + j] = beta * c_data[i * n + j] + alpha * sum;
+        }
+    }
+
+}
+
+/// 将张量中所有元素填充成同一个值
+pub fn fill(t: &mut Tensor<f32>, value: f32) {
+    let data = unsafe { t.data_mut() };
+    for x in data.iter_mut() {
+        *x = value;
+    }
+}
+
+/// 将 src 的所有元素逐一复制到 dst，要求二者 size() 相同。
+pub fn copy_slice(src: &Tensor<f32>, dst: &mut Tensor<f32>) {
+    assert_eq!(
+        src.size(),
+        dst.size(),
+        "copy_slice: src and dst must have the same number of elements"
+    );
+
+    let src_data = src.data();
+    let dst_data = unsafe { dst.data_mut() };
+
+    dst_data.copy_from_slice(src_data);
+}
+
+/// 普通矩阵乘法: C = alpha * (A @ B) + beta * C
+/// A: shape = [M, K]
+/// B: shape = [K, N]
+/// C: shape = [M, N]
+pub fn matmul(
+    c: &mut Tensor<f32>,    // 输出矩阵 C
+    beta: f32,              // 原 C 的缩放系数
+    a: &Tensor<f32>,        // 输入矩阵 A
+    b: &Tensor<f32>,        // 输入矩阵 B
+    alpha: f32,             // A @ B 的缩放系数
+) {
+    // 打印输入形状
+    // println!(
+    //     "Shape of A: {:?}, Shape of B: {:?}, Shape of C: {:?}",
+    //     a.shape(),
+    //     b.shape(),
+    //     c.shape()
+    // );
+
+    // 断言形状合法性
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+    let c_shape = c.shape();
+
+    assert_eq!(a_shape.len(), 2, "A must be a 2D matrix");
+    assert_eq!(b_shape.len(), 2, "B must be a 2D matrix");
+    assert_eq!(c_shape.len(), 2, "C must be a 2D matrix");
+
+    let (m, k1) = (a_shape[0], a_shape[1]);
+    let (k2, n) = (b_shape[0], b_shape[1]);
+    let (cm, cn) = (c_shape[0], c_shape[1]);
+
+    assert_eq!(k1, k2, "Inner dimensions of A and B must match");
+    assert_eq!(m, cm, "Output rows must match A's rows");
+    assert_eq!(n, cn, "Output columns must match B's columns");
+
+    let a_data = a.data();
+    let b_data = b.data();
+    let c_data = unsafe { c.data_mut() };
+
+    // 矩阵乘法计算
+    for i in 0..m {
+        for j in 0..n {
+            let mut sum = 0.0;
+            for k in 0..k1 {
+                sum += a_data[i * k1 + k] * b_data[k * n + j];
+            }
+            c_data[i * n + j] = alpha * sum + beta * c_data[i * n + j];
+        }
+    }
+}
+
+/// 元素相加：C = A + B
+/// 要求 A, B, C 的形状完全相同
+pub fn add(c: &mut Tensor<f32>, a: &Tensor<f32>, b: &Tensor<f32>) {
+    // 1) 断言形状相同
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+    let c_shape = c.shape();
+
+    assert_eq!(a_shape, b_shape, "A and B must have the same shape");
+    assert_eq!(a_shape, c_shape, "A, B, and C must have the same shape");
+
+    let a_data = a.data();
+    let b_data = b.data();
+    let c_data = unsafe { c.data_mut() };
+
+    // 2) 元素相加
+    for i in 0..a_data.len() {
+        c_data[i] = a_data[i] + b_data[i];
+    }
+}
+
+pub fn add_in_place(a: &mut Tensor<f32>, b: &Tensor<f32>) {
+    // 1) 断言形状相同
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+
+    assert_eq!(a_shape, b_shape, "A and B must have the same shape");
+
+    let a_data = unsafe { a.data_mut() };
+    let b_data = b.data();
+
+    // 2) 元素相加
+    for i in 0..a_data.len() {
+        a_data[i] += b_data[i];
+    }
 }
 
 // Dot product of two tensors (treated as vectors)
