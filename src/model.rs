@@ -22,7 +22,7 @@ pub struct Llama<T> {
     pub(crate) max_seq_len: usize,     // maximum sequence length
     params: LLamaParams<T>, // trained weights of this model
     bos_token_id: u32,      // start token id
-    eos_token_id: u32,      // end token id
+    pub eos_token_id: u32,      // end token id
 }
 
 impl Llama<f32> {
@@ -86,16 +86,11 @@ impl Llama<f32> {
 
             // Q, K, V 的计算
             let q = (&mut q_buf).reshape(&vec![seq_len, self.n_q_h * self.dqkv]);
+            // let q = &mut q_buf;
             let k = &mut cache.k_cache(layer, past_seq_len);
             let v = &mut cache.v_cache(layer, past_seq_len);
 
             OP::matmul_transb(q, 0., &hidden_states, &self.params.wq[layer], 1.0);
-            // println!(
-            //     "Layer {}: hidden_states shape: {:?}, wk[layer] shape: {:?}",
-            //     layer,
-            //     hidden_states.shape(),
-            //     self.params.wk[layer].shape()
-            // );
             OP::matmul_transb(k, 0., &hidden_states, &self.params.wk[layer], 1.0);
             OP::matmul_transb(v, 0., &hidden_states, &self.params.wv[layer], 1.0);
 
@@ -165,6 +160,9 @@ impl Llama<f32> {
         // let hidden_states_last = hidden_states.clone();
         OP::matmul_transb(&mut logits, 0., &hidden_states, &self.params.lm_head, 1.0);
 
+        // let logits_data = logits.data();
+        // let max_logit = logits_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        // println!("[DEBUG] max_logit={:?}, top5 tokens = ...", max_logit);
         logits
     }
 
@@ -510,49 +508,85 @@ pub fn self_attention_multihead(
     seq_len: usize,                  // 当前序列长度
     total_seq_len: usize,            // 总序列长度 (包括缓存)
 ) {
-    let n_groups = n_q_h / n_kv_h; // Q 的头数是 KV 的整数倍
-    let scale = (dqkv as f32).sqrt();
+    // let n_groups = n_q_h / n_kv_h; // Q 的头数是 KV 的整数倍
 
-    // =========== Step 1: Q × K^T ===========
-    for kv_head in 0..n_kv_h {
-        for group in 0..n_groups {
-            let q_head = kv_head * n_groups + group;
+    let n_groups = n_q_h / n_kv_h;
 
-            // 提取对应的 Q 和 K 块
-            let q_sub = q.slice(q_head * dqkv, &vec![seq_len, dqkv]);
-            let k_sub = k.slice(kv_head * dqkv, &vec![total_seq_len, dqkv]);
+    // ================ Step 1: Q*K^T / sqrt(dqkv) => fill att_scores ===================
+    // 先清0
+    {
+        let data = unsafe { att_scores.data_mut() };
+        data.fill(0.0);
+    }
+    let q_data = q.data();
+    let k_data = k.data();
+    let att_data = unsafe { att_scores.data_mut() };
+    let inv_scale = 1.0 / (dqkv as f32).sqrt();
 
-            // 提取 att_scores 的当前块
-            let mut att_sub = att_scores.slice(
-                (kv_head * n_groups + group) * seq_len * total_seq_len,
-                &vec![seq_len, total_seq_len],
-            );
+    // att_scores shape = [n_kv_h, n_groups, seq_len, total_seq_len]
+    // index = kv_head*(n_groups*seq_len*total_seq_len) + group*(seq_len*total_seq_len)
+    //         + i_seq*total_seq_len + i_tseq
 
-            // 计算 att_scores: Q × K^T
-            OP::matmul_transb(&mut att_sub, 0.0, &q_sub, &k_sub, 1.0 / scale);
+    // Q shape = [seq_len, n_q_h*dqkv] => Q的index: i_seq*(n_q_h*dqkv) + q_head*dqkv + d
+    // K shape = [total_seq_len, n_kv_h*dqkv]
+    //           i_tseq*(n_kv_h*dqkv) + kv_head*dqkv + d
+    for group in 0..n_groups {
+        for kv_head_i in 0..n_kv_h {
+            let q_head = group*n_kv_h + kv_head_i; // 头号匹配
+            for i_seq in 0..seq_len {
+                let q_offset = i_seq*(n_q_h*dqkv) + q_head*dqkv;
+                for i_tseq in 0..total_seq_len {
+                    let k_offset = i_tseq*(n_kv_h*dqkv) + kv_head_i*dqkv;
+                    let mut dot = 0.0;
+                    for d in 0..dqkv {
+                        dot += q_data[q_offset + d] * k_data[k_offset + d];
+                    }
+                    dot *= inv_scale;
+
+                    let att_idx = kv_head_i*(n_groups*seq_len*total_seq_len)
+                        + group*(seq_len*total_seq_len)
+                        + i_seq*total_seq_len
+                        + i_tseq;
+                    att_data[att_idx] = dot;
+                }
+            }
         }
     }
 
-    // =========== Step 2: Apply softmax ===========
+    // ================ Step 2: masked_softmax ===================
     OP::masked_softmax(att_scores);
 
-    // =========== Step 3: att_scores × V ===========
-    for kv_head in 0..n_kv_h {
-        for group in 0..n_groups {
-            let q_head = kv_head * n_groups + group;
+    // ================ Step 3: hidden_states = att_scores × V  ===================
+    // 先清0
+    {
+        let hs_data = unsafe { hidden_states.data_mut() };
+        hs_data.fill(0.0);
+    }
+    let att_data = att_scores.data();
+    let v_data = v.data();
+    let hs_data = unsafe { hidden_states.data_mut() };
 
-            // 提取 att_scores 和 V 的对应块
-            let att_sub = att_scores.slice(
-                (kv_head * n_groups + group) * seq_len * total_seq_len,
-                &vec![seq_len, total_seq_len],
-            );
-            let v_sub = v.slice(kv_head * dqkv, &vec![total_seq_len, dqkv]);
+    // hidden_states shape = [seq_len, n_q_h*dqkv]
+    // index = i_seq*(n_q_h*dqkv) + q_head*dqkv + d
+    for group in 0..n_groups {
+        for kv_head_i in 0..n_kv_h {
+            let q_head = group*n_kv_h + kv_head_i;
+            for i_seq in 0..seq_len {
+                for d in 0..dqkv {
+                    let mut sum = 0.0;
+                    for i_tseq in 0..total_seq_len {
+                        let att_idx = kv_head_i*(n_groups*seq_len*total_seq_len)
+                            + group*(seq_len*total_seq_len)
+                            + i_seq*total_seq_len
+                            + i_tseq;
 
-            // 提取 hidden_states 的对应块
-            let mut out_sub = hidden_states.slice(q_head * dqkv, &vec![seq_len, dqkv]);
-
-            // 计算 hidden_states: att_scores × V
-            OP::matmul(&mut out_sub, 0.0, &att_sub, &v_sub, 1.0);
+                        let v_offset = i_tseq*(n_kv_h*dqkv) + kv_head_i*dqkv;
+                        sum += att_data[att_idx] * v_data[v_offset + d];
+                    }
+                    let hs_offset = i_seq*(n_q_h*dqkv) + q_head*dqkv;
+                    hs_data[hs_offset + d] = sum;
+                }
+            }
         }
     }
 }
@@ -580,14 +614,17 @@ fn mlp(
     // Step 1: RMS Normalization
     OP::rms_norm(hidden_states, residual, rms_w, eps);
 
-    // Step 2: Compute Gate and Up Projections
+    // 2) 计算 gate_buf = hidden_states x w_gate^T
+    //    计算 up_buf   = hidden_states x w_up^T
+    //    alpha=1.0, beta=0.0 表示“完全用新结果覆盖 gate_buf / up_buf”
     OP::matmul_transb(gate, 0.0, hidden_states, w_gate, 1.0);
-    OP::matmul_transb(up, 0.0, hidden_states, w_up, 1.0);
+    OP::matmul_transb(up,   0.0, hidden_states, w_up,   1.0);
 
-    // Step 3: Apply SiLU activation
-    OP::swiglu(gate, up);
+    // 3) gate_buf = swiglu(gate_buf, up_buf)
+    OP::swiglu(up, &gate);
 
-    // Step 4: Compute residual
+    // 4) residual += gate_buf x w_down^T
+    //    这里 alpha=1.0, beta=1.0 表示“新的乘积加到 residual 上”
     OP::matmul_transb(residual, 1.0, gate, w_down, 1.0);
 }
 
@@ -657,4 +694,43 @@ pub fn test_load_safetensors() {
     assert!(float_eq(&model.params.wv[0].data()[100], &0.041015625, 1e-6));
     assert!(float_eq(&model.params.wo[0].data()[100], &0.01965332, 1e-6));
 
+}
+
+
+#[test]
+fn test_self_attention_multihead() {
+    let n_q_h = 32; // Q 的头数
+    let n_kv_h = 8; // K 和 V 的头数
+    let dqkv = 26;  // 每个头的维度大小
+    let seq_len = 10;
+    let total_seq_len = 20;
+
+    // 初始化张量
+    let q = Tensor::<f32>::default(&vec![seq_len, n_q_h * dqkv]); // [seq_len, n_q_h * dqkv]
+    let k = Tensor::<f32>::default(&vec![total_seq_len, n_kv_h * dqkv]); // [total_seq_len, n_kv_h * dqkv]
+    let v = Tensor::<f32>::default(&vec![total_seq_len, n_kv_h * dqkv]); // [total_seq_len, n_kv_h * dqkv]
+    let mut att_scores = Tensor::<f32>::default(&vec![n_kv_h, n_q_h / n_kv_h, seq_len, total_seq_len]);
+    let mut hidden_states = Tensor::<f32>::default(&vec![seq_len, n_q_h * dqkv]);
+
+    // 验证输入形状
+    assert_eq!(q.shape(), &vec![seq_len, n_q_h * dqkv]);
+    assert_eq!(k.shape(), &vec![total_seq_len, n_kv_h * dqkv]);
+    assert_eq!(v.shape(), &vec![total_seq_len, n_kv_h * dqkv]);
+
+    // 执行 Self-Attention
+    self_attention_multihead(
+        &mut hidden_states,
+        &q,
+        &k,
+        &v,
+        &mut att_scores,
+        n_q_h,
+        n_kv_h,
+        dqkv,
+        seq_len,
+        total_seq_len,
+    );
+
+    // 验证输出形状
+    assert_eq!(hidden_states.shape(), &vec![seq_len, n_q_h * dqkv]);
 }
