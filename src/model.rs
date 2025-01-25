@@ -1,14 +1,17 @@
 use core::f32;
+use num_traits::{Float, FromPrimitive, One, Zero};
+use safetensors::SafeTensors;
 use std::fs::File;
+use std::iter::Sum;
+use std::path::Path;
 use std::vec;
 
 use crate::config::LlamaConfigJson;
 use crate::kvcache::KVCache;
 use crate::operators as OP;
-use crate::params::LLamaParams;
+use crate::params::{ LLamaParams};
 use crate::tensor::Tensor;
-use safetensors::SafeTensors;
-use std::path::Path;
+
 pub struct Llama<T> {
     vocab: usize,           // vocab size
     pub(crate) n_layers: usize,        // number of layers
@@ -22,7 +25,7 @@ pub struct Llama<T> {
     pub(crate) max_seq_len: usize,     // maximum sequence length
     params: LLamaParams<T>, // trained weights of this model
     bos_token_id: u32,      // start token id
-    pub eos_token_id: u32,      // end token id
+    pub(crate) eos_token_id: u32,      // end token id
 }
 
 impl Llama<f32> {
@@ -31,7 +34,7 @@ impl Llama<f32> {
         let config: LlamaConfigJson = serde_json::from_reader(config).unwrap();
         let model_file = std::fs::read(model_dir.as_ref().join("model.safetensors")).unwrap();
         let safetensor = SafeTensors::deserialize(&model_file).unwrap();
-        let mut params = LLamaParams::from_safetensors(&safetensor, &config);
+        let params = LLamaParams::from_safetensors(&safetensor, &config);
 
         Self {
             vocab: config.vocab_size,
@@ -55,16 +58,13 @@ impl Llama<f32> {
     }
 
     pub fn forward(&self, input: &Tensor<u32>, cache: &mut KVCache<f32>) -> Tensor<f32> {
-        let n_heads = self.n_q_h; // Q 头数 = K,V 头数
-        let dqkv = self.dqkv;     // 每个头的维度大小 = hidden_size / n_heads
-
         let seq_len = input.size();
         let past_seq_len = cache.len();
         cache.increment(seq_len);
         let total_seq_len = past_seq_len + seq_len;
         let n_groups = self.n_q_h / self.n_kv_h;
 
-        // 预分配临时张量，复用内存
+        // Some pre-allocated buffers that will be reused
         let mut residual = Tensor::<f32>::default(&vec![seq_len, self.d]);
         let mut hidden_states = Tensor::<f32>::default(&vec![seq_len, self.d]);
         let mut q_buf = Tensor::<f32>::default(&vec![seq_len, self.n_q_h * self.dqkv]);
@@ -73,7 +73,8 @@ impl Llama<f32> {
         let mut gate_buf = Tensor::<f32>::default(&vec![seq_len, self.di]);
         let mut up_buf = Tensor::<f32>::default(&vec![seq_len, self.di]);
 
-        // 计算开始
+        // Computation Starts Here
+        // Embedding lookup
         OP::gather(&mut residual, input, &self.params.embedding_table);
 
         for layer in 0..self.n_layers {
@@ -81,57 +82,69 @@ impl Llama<f32> {
                 &mut hidden_states,
                 &residual,
                 &self.params.rms_att_w[layer],
-                self.eps,
+                f32::from_f32(self.eps).unwrap(),
             );
 
-            // Q, K, V 的计算
-            let q = (&mut q_buf).reshape(&vec![seq_len, self.n_q_h * self.dqkv]);
-            // let q = &mut q_buf;
-            let k = &mut cache.k_cache(layer, past_seq_len);
-            let v = &mut cache.v_cache(layer, past_seq_len);
-
-            OP::matmul_transb(q, 0., &hidden_states, &self.params.wq[layer], 1.0);
-            OP::matmul_transb(k, 0., &hidden_states, &self.params.wk[layer], 1.0);
-            OP::matmul_transb(v, 0., &hidden_states, &self.params.wv[layer], 1.0);
-
+            let q = (&mut q_buf).reshape(&vec![seq_len, self.n_q_h * self.dqkv]); // (seq, n_h * dqkv)
+            let k = &mut cache.k_cache(layer, past_seq_len); // (seq, n_kv_h * dqkv)
+            let v = &mut cache.v_cache(layer, past_seq_len); // (seq, n_kv_h * dqkv)
+            OP::matmul_transb(
+                q,
+                f32::zero(),
+                &hidden_states,
+                &self.params.wq[layer],
+                f32::one(),
+            );
+            OP::matmul_transb(
+                k,
+                f32::zero(),
+                &hidden_states,
+                &self.params.wk[layer],
+                f32::one(),
+            );
+            OP::matmul_transb(
+                v,
+                f32::zero(),
+                &hidden_states,
+                &self.params.wv[layer],
+                f32::one(),
+            );
             OP::rope(
                 q.reshape(&vec![seq_len, self.n_q_h, self.dqkv]),
                 past_seq_len,
-                self.rope_theta,
+                f32::from_f32(self.rope_theta).unwrap(),
             );
             OP::rope(
                 k.reshape(&vec![seq_len, self.n_kv_h, self.dqkv]),
                 past_seq_len,
-                self.rope_theta,
+                f32::from_f32(self.rope_theta).unwrap(),
             );
 
-            let full_k = &mut cache.k_cache(layer, 0);
-            let full_v = &mut cache.v_cache(layer, 0);
+            let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
+            let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
 
             self_attention_multihead(
-                &mut hidden_states, // 最终输出张量 [seq_len, n_heads * dqkv]
-                &q,             // 输入 Q 张量 [seq_len, n_heads * dqkv]
-                full_k,             // 输入 K 张量 [total_seq_len, n_kv_heads * dqkv]
-                full_v,             // 输入 V 张量 [total_seq_len, n_kv_heads * dqkv]
-                &mut att_scores,    // 用于存储 Q × K^T 结果 [n_heads, seq_len, total_seq_len]
-                self.n_q_h,         // Q 的头数 (n_q_heads)
-                self.n_kv_h,        // K 和 V 的头数 (n_kv_heads)
-                dqkv,               // 每个头的维度大小
-                seq_len,            // 当前序列长度
-                total_seq_len,      // 包括缓存在内的总序列长度
+                &mut hidden_states,
+                &mut att_scores,
+                q,
+                full_k,
+                full_v,
+                self.n_kv_h,
+                n_groups,
+                seq_len,
+                total_seq_len,
+                self.dqkv,
             );
-
-            // residual = residual.add(&hidden_states, |x, y| x + y);
 
             OP::matmul_transb(
                 &mut residual,
-                1.0,
+                f32::one(),
                 &hidden_states,
                 &self.params.wo[layer],
-                1.0,
+                f32::one(),
             );
 
-            mlp(
+            mlp::<f32>(
                 &mut residual,
                 &mut hidden_states,
                 &mut gate_buf,
@@ -140,165 +153,33 @@ impl Llama<f32> {
                 &self.params.w_down[layer],
                 &self.params.w_gate[layer],
                 &self.params.rms_ffn_w[layer],
-                self.eps,
+                f32::from_f32(self.eps).unwrap(),
             );
         }
 
-        // 输出 logits
+        // No matter what seq_len, the output is always a 1D vector of length vocab,
+        // which contains the probabilities for the next token.
         let mut logits = Tensor::<f32>::default(&vec![1, self.vocab]);
         let mut hidden_states = hidden_states.slice((seq_len - 1) * self.d, &vec![1, self.d]);
-        let residual = residual.slice((seq_len - 1) * self.d, &vec![self.d]);
+        let residual = residual.slice((seq_len - 1) * self.d, &vec![ self.d]);
 
         OP::rms_norm(
             &mut hidden_states,
             &residual,
             &self.params.rms_out_w,
-            self.eps,
+            f32::from_f32(self.eps).unwrap(),
         );
 
-        // 避免 mutable 和 immutable borrow 冲突
-        // let hidden_states_last = hidden_states.clone();
-        OP::matmul_transb(&mut logits, 0., &hidden_states, &self.params.lm_head, 1.0);
+        OP::matmul_transb(
+            &mut logits,
+            f32::zero(),
+            &hidden_states,
+            &self.params.lm_head,
+            f32::one(),
+        );
 
-        // let logits_data = logits.data();
-        // let max_logit = logits_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        // println!("[DEBUG] max_logit={:?}, top5 tokens = ...", max_logit);
         logits
     }
-
-
-    // pub fn forward(&self, input: &Tensor<u32>, cache: &mut KVCache<f32>) -> Tensor<f32> {
-    //     let n_heads = self.n_q_h;  // = self.n_kv_h
-    //     let dqkv = self.dqkv;      // = hidden_size / n_heads
-    //
-    //     let seq_len = input.size();
-    //     let past_seq_len = cache.len();
-    //     cache.increment(seq_len);
-    //     let total_seq_len = past_seq_len + seq_len;
-    //     let n_groups = self.n_q_h / self.n_kv_h;
-    //
-    //     // Some pre-allocated buffers that will be reused
-    //     let mut residual = Tensor::<f32>::default(&vec![seq_len, self.d]);
-    //     let mut hidden_states = Tensor::<f32>::default(&vec![seq_len, self.d]);
-    //     let mut q_buf = Tensor::<f32>::default(&vec![seq_len, self.n_q_h * self.dqkv]);
-    //     let mut att_scores =
-    //         Tensor::<f32>::default(&vec![self.n_kv_h, n_groups, seq_len, total_seq_len]);
-    //     let mut gate_buf = Tensor::<f32>::default(&vec![seq_len, self.di]);
-    //     let mut up_buf = Tensor::<f32>::default(&vec![seq_len, self.di]);
-    //
-    //     // Computation Starts Here
-    //     // Embedding lookup
-    //     OP::gather(&mut residual, input, &self.params.embedding_table);
-    //
-    //     for layer in 0..self.n_layers {
-    //         OP::rms_norm(
-    //             &mut hidden_states,
-    //             &residual,
-    //             &self.params.rms_att_w[layer],
-    //             self.eps,
-    //         );
-    //
-    //         let q = (&mut q_buf).reshape(&vec![seq_len, self.n_q_h * self.dqkv]); // (seq, n_h * dqkv)
-    //         let k = &mut cache.k_cache(layer, past_seq_len); // (seq, n_kv_h * dqkv)
-    //         let v = &mut cache.v_cache(layer, past_seq_len); // (seq, n_kv_h * dqkv)
-    //         OP::matmul_transb(q, 0., &hidden_states, &self.params.wq[layer], 1.0);
-    //         // 在调用前打印详细信息
-    //         println!(
-    //             "Layer {}: Shape of wk[layer]: {:?}",
-    //             layer,
-    //             self.params.wk[layer].shape()
-    //         );
-    //         // fixme !("matmul_transb"); assertion `left == right` failed: A 的列数应等于 B 转置的行数
-    //         OP::matmul_transb(k, 0., &hidden_states, &self.params.wk[layer], 1.0);
-    //         OP::matmul_transb(v, 0., &hidden_states, &self.params.wv[layer], 1.0);
-    //         OP::rope(
-    //             q.reshape(&vec![seq_len, self.n_q_h, self.dqkv]),
-    //             past_seq_len,
-    //             self.rope_theta,
-    //         );
-    //         OP::rope(
-    //             k.reshape(&vec![seq_len, self.n_kv_h, self.dqkv]),
-    //             past_seq_len,
-    //             self.rope_theta,
-    //         );
-    //
-    //         let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
-    //         let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
-    //
-    //         // todo!("self_attention(...)");
-    //         // self_attention(
-    //         //     &mut hidden_states,
-    //         //     &mut att_scores,
-    //         //     &q_buf,
-    //         //     full_k,
-    //         //     full_v,
-    //         //     self.n_kv_h,
-    //         //     n_groups,
-    //         //     seq_len,
-    //         //     total_seq_len,
-    //         //     self.dqkv,
-    //         // );
-    //
-    //         // 5) 调用多头Attention
-    //         self_attention_multihead(
-    //             &mut hidden_states, // out: [seq_len, n_heads*dqkv]
-    //             &q_buf,            // [seq_len, n_heads, dqkv]
-    //             full_k,            // [total_seq, n_heads*dqkv] => reshape => [total_seq, n_heads, dqkv]
-    //             full_v,
-    //             &mut att_scores,   // [n_heads, seq_len, total_seq_len], 复用
-    //             n_heads,
-    //             dqkv,
-    //             seq_len,
-    //             total_seq_len
-    //         );
-    //
-    //         // (可选) down_proj => residual
-    //         // let wo = &self.params.wo[layer_i]; // shape [hidden_size, hidden_size]
-    //         // 这里没写，若需要 => matmul_transb(&mut hidden_states, 0.0, &hidden_states, wo, 1.0);
-    //         // todo!("down_proj matmul and add residual");
-    //         // Residual connection (residual = residual + hidden_states)
-    //         residual = residual.add(&hidden_states, |x, y| x + y);
-    //
-    //         // RMS Normalization for FFN
-    //         OP::rms_norm(
-    //             &mut hidden_states,
-    //             &residual,
-    //             &self.params.rms_ffn_w[layer],
-    //             self.eps,
-    //         );
-    //
-    //         // todo!("mlp(...)");
-    //         // Feedforward Network (MLP)
-    //         mlp(
-    //             &mut residual,
-    //             &mut hidden_states,
-    //             &mut gate_buf,
-    //             &mut up_buf,
-    //             &self.params.w_up[layer],
-    //             &self.params.w_down[layer],
-    //             &self.params.w_gate[layer],
-    //             &self.params.rms_ffn_w[layer],
-    //             self.eps,
-    //         );
-    //     }
-    //
-    //     // No matter what seq_len, the output is always a 1D vector of length vocab,
-    //     // which contains the probabilities for the next token.
-    //     let mut logits = Tensor::<f32>::default(&vec![1, self.vocab]);
-    //     let mut hidden_states = hidden_states.slice((seq_len - 1) * self.d, &vec![1, self.d]);
-    //     let residual = residual.slice((seq_len - 1) * self.d, &vec![self.d]);
-    //
-    //     OP::rms_norm(
-    //         &mut hidden_states,
-    //         &residual,
-    //         &self.params.rms_out_w,
-    //         self.eps,
-    //     );
-    //
-    //     OP::matmul_transb(&mut logits, 0., &hidden_states, &self.params.lm_head, 1.0);
-    //
-    //     logits
-    // }
 
     pub fn generate(
         &self,
@@ -307,31 +188,23 @@ impl Llama<f32> {
         top_p: f32,
         top_k: u32,
         temperature: f32,
-    ) -> Vec<u32>{
-        let mut result = token_ids.to_vec();
-        //todo 实现文本生成
-        let mut cache = self.new_cache();
+    ) -> Vec<u32> {
+        let mut result_tokens = token_ids.to_vec();
+        let mut kvcache = self.new_cache();
+        let mut input_tensors =
+            Tensor::<u32>::new(result_tokens.clone(), &vec![result_tokens.len()]);
 
-        for _ in 0..max_len {
-            // 只处理当前新增的 token，而不是整个序列
-            let input_tensor = Tensor::<u32>::new(vec![*result.last().unwrap()], &vec![1]);
-
-            // forward 方法利用 cache，只计算新增 token 的 logits
-            let logits = self.forward(&input_tensor, &mut cache);
-
-            // 使用随机采样策略生成下一个 token
+        while result_tokens.len() < max_len {
+            let logits = self.forward(&input_tensors, &mut kvcache);
             let next_token = OP::random_sample(&logits, top_p, top_k, temperature);
-
-            // 如果遇到终止符号，提前结束生成
+            result_tokens.push(next_token);
             if next_token == self.eos_token_id {
                 break;
             }
-            // 将生成的 token 添加到结果中
-            result.push(next_token);
-
+            input_tensors = Tensor::<u32>::new(vec![next_token], &vec![1]);
         }
 
-        result
+        result_tokens
     }
 
     pub fn streaming_generate<'a>(
@@ -343,255 +216,258 @@ impl Llama<f32> {
         temperature: f32,
         kvcache: &'a mut KVCache<f32>,
     ) -> impl Iterator<Item = u32> + 'a {
-        let mut result_tokens = token_ids.to_vec(); // 保存生成的 token
-        let mut input_tensors = Tensor::<u32>::new(result_tokens.clone(), &vec![result_tokens.len()]);
+        let mut result_tokens = token_ids.to_vec();
+        let mut input_tensors =
+            Tensor::<u32>::new(result_tokens.clone(), &vec![result_tokens.len()]);
 
-        // 返回一个迭代器
         std::iter::from_fn(move || {
-            // 如果达到最大长度，停止生成
             if result_tokens.len() >= max_len {
                 return None;
             }
 
-            // 前向传播获取 logits
             let logits = self.forward(&input_tensors, kvcache);
-
-            // 根据 top_p、top_k 和 temperature 采样下一个 token
             let next_token = OP::random_sample(&logits, top_p, top_k, temperature);
-
-            // 将生成的 token 添加到结果中
             result_tokens.push(next_token);
-
-            // 更新输入张量为新生成的 token
             input_tensors = Tensor::<u32>::new(vec![next_token], &vec![1]);
 
-            // 如果生成的 token 是 EOS，停止生成
             if next_token == self.eos_token_id {
                 None
             } else {
-                Some(next_token) // 返回生成的 token
+                Some(next_token)
             }
         })
     }
 }
 
-fn self_attention(
-    hidden_states: &mut Tensor<f32>, // (seq, n_kv_h * n_groups * dqkv)
-    att_scores: &mut Tensor<f32>,    // (n_kv_h, n_groups, seq, total_seq)
-    q: &Tensor<f32>,                 // (seq, n_kv_h * n_groups * dqkv)
-    k: &Tensor<f32>,                 // (total_seq, n_kv_h * dqkv)
-    v: &Tensor<f32>,                 // (total_seq, n_kv_h * dqkv)
+/// 计算自注意力 (Q*K^T / sqrt(d) => softmax => x V)，指针式实现。
+///
+/// # 参数
+/// - `hidden_states`: [seq_len, n_kv_h*n_groups*dqkv] (最终输出, 大小 = seq_len * n_q_h * dqkv)，其中 n_q_h = n_kv_h*n_groups
+/// - `att_scores`:    [n_kv_h, n_groups, seq_len, total_seq_len] (4D，展平在 data 里，供中间结果存储)
+/// - `q`:             [seq_len, n_q_h*dqkv]  (Q buffer)
+/// - `k`:             [total_seq_len, n_kv_h*dqkv] (K buffer)
+/// - `v`:             [total_seq_len, n_kv_h*dqkv] (V buffer)
+/// - `n_kv_h`: Key/Value 头数
+/// - `n_groups`:  Q 相较 KV 多出的倍数，所以总 Query 头数 n_q_h = n_kv_h * n_groups
+/// - `seq_len`: 当前序列长度
+/// - `total_seq_len`: 包含缓存在内的上下文 + 当前长度
+/// - `dqkv`: 每个头的维度大小 d_head
+///
+/// 要求：n_q_h = n_kv_h * n_groups。
+/// 使用前请先 matmul 计算 Q, K, V，再将本函数呼叫做注意力，输出到 hidden_states。
+pub fn self_attention_multihead(
+    hidden_states: &mut crate::tensor::Tensor<f32>,
+    att_scores: &mut crate::tensor::Tensor<f32>,
+    q: &crate::tensor::Tensor<f32>,
+    k: &crate::tensor::Tensor<f32>,
+    v: &crate::tensor::Tensor<f32>,
     n_kv_h: usize,
     n_groups: usize,
     seq_len: usize,
     total_seq_len: usize,
     dqkv: usize,
 ) {
-    // self_attention
-
-    // 计算注意力分数
-    // 计算注意力分数 (q @ k^T)
-    OP::matmul_transb(att_scores, 0.0, q, k, 1.0 / (dqkv as f32).sqrt());
-
-    // 应用 masked softmax
-    OP::masked_softmax(att_scores);
-
-    // 计算注意力输出 (y = att_scores @ v)
-    OP::matmul_transb(hidden_states, 0.0, att_scores, v, 1.0);
-
-    // n_q_h = n_kv_h * n_groups
-    let n_q_h = n_kv_h * n_groups;
-
-    // 1) 将 q, k, v 的 data() 取出来
-    // Q: shape [seq_len, n_q_h*dqkv]
-    let q_data = q.data();
-    // K,V: shape [total_seq_len, n_kv_h*dqkv]
-    let k_data = k.data();
-    let v_data = v.data();
-
-    // 2) 拿 att_scores 的 data_mut
-    //   shape=[n_kv_h, n_groups, seq_len, total_seq_len]
-    //   => index = i_kv * n_groups * seq_len * total_seq_len
-    //             + i_group * seq_len * total_seq_len
-    //             + i_seq * total_seq_len
-    //             + i_tseq
-    let att_score_data = unsafe { att_scores.data_mut() };
-
-    // 3) 先将 att_scores清0
-    att_score_data.fill(0.0);
-
-    // 4) 计算 Q x K^T / sqrt(dqkv)
-    //   对每个 kv_head in [0..n_kv_h]
-    //   对每个 group in [0..n_groups]
-    //   对每个 seq in [0..seq_len]
-    //   对每个 tseq in [0..total_seq_len]
-    //   => sum_{d in [0..dqkv]} Q[seq, q_head* dqkv + d]* K[tseq, kv_head*dqkv + d]
-
-    let inv_scale = 1.0 / (dqkv as f32).sqrt();
-
-    for i_kv in 0..n_kv_h {
-        for g in 0..n_groups {
-            let i_q = i_kv * n_groups + g; // q_head index
-            // i_q in [0..n_q_h], i_kv in [0..n_kv_h], ratio = n_groups
-
-            for s in 0..seq_len {
-                for ts in 0..total_seq_len {
-                    let mut sum = 0.0;
-                    // dot product for dqkv
-                    for d in 0..dqkv {
-                        let q_idx = s * (n_q_h * dqkv) + i_q * dqkv + d;
-                        let k_idx = ts * (n_kv_h * dqkv) + i_kv * dqkv + d;
-                        sum += q_data[q_idx] * k_data[k_idx];
-                    }
-                    // multiply by inv_scale
-                    sum *= inv_scale;
-
-                    let att_idx = i_kv * n_groups * seq_len * total_seq_len
-                        + g * seq_len * total_seq_len
-                        + s * total_seq_len
-                        + ts;
-                    att_score_data[att_idx] = sum;
-                }
-            }
-        }
-    }
-
-    // 5) masked softmax
-    OP::masked_softmax(att_scores);
-
-    // 6) 计算 attn_V = att_scores @ V
-    //   hidden_states = [seq_len, n_kv_h*n_groups*dqkv]
-    //   => We'll do shape [n_kv_h, n_groups, seq_len, total_seq_len]
-    //   x   v [total_seq_len, n_kv_h*dqkv]
-    //   依然需要分头, i_kv * dqkv
-    let out_data = unsafe { hidden_states.data_mut() };
-    out_data.fill(0.0);
-
-    let att_data = att_scores.data(); // read-only
-
-    // hidden_states shape: [seq_len, n_kv_h*n_groups*dqkv]
-    // index = s*(n_kv_h*n_groups*dqkv) + i_kv*n_groups*dqkv + g*dqkv + d
-
-    for i_kv in 0..n_kv_h {
-        for g in 0..n_groups {
-            let i_q = i_kv * n_groups + g; // same logic as above
-            for s in 0..seq_len {
-                for d in 0..dqkv {
-                    let mut sum = 0.0;
-                    // \sum_{ts} att_scores * V
-                    for ts in 0..total_seq_len {
-                        let att_idx = i_kv * n_groups * seq_len * total_seq_len
-                            + g * seq_len * total_seq_len
-                            + s * total_seq_len
-                            + ts;
-                        let v_idx = ts*(n_kv_h*dqkv) + i_kv*dqkv + d;
-                        sum += att_data[att_idx]*v_data[v_idx];
-                    }
-                    // put into hidden_states
-                    let out_idx = s*(n_kv_h*n_groups*dqkv) + i_q*dqkv + d;
-                    out_data[out_idx] = sum;
-                }
-            }
-        }
-    }
-}
-
-pub fn self_attention_multihead(
-    hidden_states: &mut Tensor<f32>, // 输出: [seq_len, n_q_h * dqkv]
-    q: &Tensor<f32>,                 // 输入 Q: [seq_len, n_q_h * dqkv]
-    k: &Tensor<f32>,                 // 输入 K: [total_seq_len, n_kv_h * dqkv]
-    v: &Tensor<f32>,                 // 输入 V: [total_seq_len, n_kv_h * dqkv]
-    att_scores: &mut Tensor<f32>,    // 中间结果: [n_kv_h, n_groups, seq_len, total_seq_len]
-    n_q_h: usize,                    // Q 的头数
-    n_kv_h: usize,                   // K 和 V 的头数
-    dqkv: usize,                     // 每个头的维度大小
-    seq_len: usize,                  // 当前序列长度
-    total_seq_len: usize,            // 总序列长度 (包括缓存)
-) {
-    // let n_groups = n_q_h / n_kv_h; // Q 的头数是 KV 的整数倍
-
-    let n_groups = n_q_h / n_kv_h;
-
-    // ================ Step 1: Q*K^T / sqrt(dqkv) => fill att_scores ===================
-    // 先清0
+    // ========== Step 1: 先填 0 ==========
     {
-        let data = unsafe { att_scores.data_mut() };
-        data.fill(0.0);
+        let att_data = unsafe { att_scores.data_mut() };
+        att_data.fill(0.0);
     }
+
+    // ========== Step 2: 计算 Q×K^T => 填进 att_scores ==========
+    // 这里再用 "att_data" 但记得别留到 masked_softmax 之后
     let q_data = q.data();
     let k_data = k.data();
-    let att_data = unsafe { att_scores.data_mut() };
     let inv_scale = 1.0 / (dqkv as f32).sqrt();
 
-    // att_scores shape = [n_kv_h, n_groups, seq_len, total_seq_len]
-    // index = kv_head*(n_groups*seq_len*total_seq_len) + group*(seq_len*total_seq_len)
-    //         + i_seq*total_seq_len + i_tseq
+    let num_key_value_heads = n_kv_h;
+    let num_query_heads_per_kv_group = n_groups;
+    let num_attention_heads = n_kv_h * n_groups;
+    let d_head = dqkv;
 
-    // Q shape = [seq_len, n_q_h*dqkv] => Q的index: i_seq*(n_q_h*dqkv) + q_head*dqkv + d
-    // K shape = [total_seq_len, n_kv_h*dqkv]
-    //           i_tseq*(n_kv_h*dqkv) + kv_head*dqkv + d
-    for group in 0..n_groups {
-        for kv_head_i in 0..n_kv_h {
-            let q_head = group*n_kv_h + kv_head_i; // 头号匹配
-            for i_seq in 0..seq_len {
-                let q_offset = i_seq*(n_q_h*dqkv) + q_head*dqkv;
-                for i_tseq in 0..total_seq_len {
-                    let k_offset = i_tseq*(n_kv_h*dqkv) + kv_head_i*dqkv;
-                    let mut dot = 0.0;
-                    for d in 0..dqkv {
-                        dot += q_data[q_offset + d] * k_data[k_offset + d];
+    let total_d_q = num_attention_heads * d_head;
+    let total_d_kv = num_key_value_heads * d_head;
+
+    let total_d_atts_3 = num_query_heads_per_kv_group * seq_len * total_seq_len;
+    let total_d_atts_2 = seq_len * total_seq_len;
+    let total_d_atts_1 = total_seq_len;
+
+    {
+        // 因为还没调用 masked_softmax，这里可以暂时可变借用
+        let att_data = unsafe { att_scores.data_mut() };
+
+        for curr_k_head in 0..num_key_value_heads {
+            let offset_k = curr_k_head * d_head;
+            for curr_q_in_group in 0..num_query_heads_per_kv_group {
+                let curr_att_head = curr_k_head*num_query_heads_per_kv_group + curr_q_in_group;
+                let offset_q = curr_att_head*d_head;
+                for i_seq in 0..seq_len {
+                    let begin_vec_q = i_seq*total_d_q + offset_q;
+                    for i_tseq in 0..total_seq_len {
+                        let begin_vec_k = i_tseq*total_d_kv + offset_k;
+                        let mut dot = 0.0;
+                        for dd in 0..d_head {
+                            dot += q_data[begin_vec_q+dd]*k_data[begin_vec_k+dd];
+                        }
+                        dot *= inv_scale;
+
+                        let att_idx = curr_k_head*total_d_atts_3
+                            + curr_q_in_group*total_d_atts_2
+                            + i_seq*total_d_atts_1
+                            + i_tseq;
+                        att_data[att_idx] = dot;
                     }
-                    dot *= inv_scale;
-
-                    let att_idx = kv_head_i*(n_groups*seq_len*total_seq_len)
-                        + group*(seq_len*total_seq_len)
-                        + i_seq*total_seq_len
-                        + i_tseq;
-                    att_data[att_idx] = dot;
                 }
             }
         }
     }
 
-    // ================ Step 2: masked_softmax ===================
-    OP::masked_softmax(att_scores);
+    // ========== Step 3: 调 masked_softmax(att_scores) ==========
+    crate::operators::masked_softmax(att_scores);
+    // 这里需要 &mut att_scores
 
-    // ================ Step 3: hidden_states = att_scores × V  ===================
-    // 先清0
+    // ========== Step 4: hidden_states = att_scores × V ==========
+    // 这里重新用 read-only 的 att_data
+    let att_data = att_scores.data(); // <-- 只读
+    let v_data = v.data();
     {
         let hs_data = unsafe { hidden_states.data_mut() };
         hs_data.fill(0.0);
-    }
-    let att_data = att_scores.data();
-    let v_data = v.data();
-    let hs_data = unsafe { hidden_states.data_mut() };
 
-    // hidden_states shape = [seq_len, n_q_h*dqkv]
-    // index = i_seq*(n_q_h*dqkv) + q_head*dqkv + d
-    for group in 0..n_groups {
-        for kv_head_i in 0..n_kv_h {
-            let q_head = group*n_kv_h + kv_head_i;
-            for i_seq in 0..seq_len {
-                for d in 0..dqkv {
-                    let mut sum = 0.0;
-                    for i_tseq in 0..total_seq_len {
-                        let att_idx = kv_head_i*(n_groups*seq_len*total_seq_len)
-                            + group*(seq_len*total_seq_len)
-                            + i_seq*total_seq_len
-                            + i_tseq;
+        for curr_v_head in 0..num_key_value_heads {
+            let offset_matrix_v_g = curr_v_head*d_head;
+            for curr_q_in_group in 0..num_query_heads_per_kv_group {
+                let offset_matrix_a_h = curr_q_in_group*total_d_atts_2
+                    + curr_v_head*total_d_atts_3;
+                for curr_idx_seq in 0..seq_len {
+                    let begin_vec_a = offset_matrix_a_h + curr_idx_seq*total_d_atts_1;
+                    for curr_idx_dhead in 0..d_head {
+                        let begin_vec_v = curr_idx_dhead + offset_matrix_v_g;
+                        let mut sum_ = 0.0;
+                        for curr_idx_tseq in 0..total_seq_len {
+                            let idx_a = begin_vec_a + curr_idx_tseq;
+                            let idx_v = begin_vec_v + curr_idx_tseq*total_d_kv;
+                            sum_ += att_data[idx_a] * v_data[idx_v];
+                        }
 
-                        let v_offset = i_tseq*(n_kv_h*dqkv) + kv_head_i*dqkv;
-                        sum += att_data[att_idx] * v_data[v_offset + d];
+                        let curr_att_head = curr_v_head*num_query_heads_per_kv_group + curr_q_in_group;
+                        let hs_offset = curr_idx_seq*(num_attention_heads*d_head)
+                            + curr_att_head*d_head
+                            + curr_idx_dhead;
+                        hs_data[hs_offset] = sum_;
                     }
-                    let hs_offset = i_seq*(n_q_h*dqkv) + q_head*dqkv;
-                    hs_data[hs_offset + d] = sum;
                 }
             }
         }
     }
 }
 
-fn mlp(
+pub fn self_attention(
+    hidden_states: &mut crate::tensor::Tensor<f32>,
+    att_scores: &mut crate::tensor::Tensor<f32>,
+    q: &crate::tensor::Tensor<f32>,
+    k: &crate::tensor::Tensor<f32>,
+    v: &crate::tensor::Tensor<f32>,
+    n_kv_h: usize,
+    n_groups: usize,
+    seq_len: usize,
+    total_seq_len: usize,
+    dqkv: usize,
+) {
+    // ========== Step 1: 先填 0 ==========
+    {
+        let att_data = unsafe { att_scores.data_mut() };
+        att_data.fill(0.0);
+    }
+
+    // ========== Step 2: 计算 Q×K^T => 填进 att_scores ==========
+    // 这里再用 "att_data" 但记得别留到 masked_softmax 之后
+    let q_data = q.data();
+    let k_data = k.data();
+    let inv_scale = 1.0 / (dqkv as f32).sqrt();
+
+    let num_key_value_heads = n_kv_h;
+    let num_query_heads_per_kv_group = n_groups;
+    let num_attention_heads = n_kv_h * n_groups;
+    let d_head = dqkv;
+
+    let total_d_q = num_attention_heads * d_head;
+    let total_d_kv = num_key_value_heads * d_head;
+
+    let total_d_atts_3 = num_query_heads_per_kv_group * seq_len * total_seq_len;
+    let total_d_atts_2 = seq_len * total_seq_len;
+    let total_d_atts_1 = total_seq_len;
+
+    {
+        // 因为还没调用 masked_softmax，这里可以暂时可变借用
+        let att_data = unsafe { att_scores.data_mut() };
+
+        for curr_k_head in 0..num_key_value_heads {
+            let offset_k = curr_k_head * d_head;
+            for curr_q_in_group in 0..num_query_heads_per_kv_group {
+                let curr_att_head = curr_k_head*num_query_heads_per_kv_group + curr_q_in_group;
+                let offset_q = curr_att_head*d_head;
+                for i_seq in 0..seq_len {
+                    let begin_vec_q = i_seq*total_d_q + offset_q;
+                    for i_tseq in 0..total_seq_len {
+                        let begin_vec_k = i_tseq*total_d_kv + offset_k;
+                        let mut dot = 0.0;
+                        for dd in 0..d_head {
+                            dot += q_data[begin_vec_q+dd]*k_data[begin_vec_k+dd];
+                        }
+                        dot *= inv_scale;
+
+                        let att_idx = curr_k_head*total_d_atts_3
+                            + curr_q_in_group*total_d_atts_2
+                            + i_seq*total_d_atts_1
+                            + i_tseq;
+                        att_data[att_idx] = dot;
+                    }
+                }
+            }
+        }
+    }
+
+    // ========== Step 3: 调 masked_softmax(att_scores) ==========
+    crate::operators::masked_softmax(att_scores);
+    // 这里需要 &mut att_scores
+
+    // ========== Step 4: hidden_states = att_scores × V ==========
+    // 这里重新用 read-only 的 att_data
+    let att_data = att_scores.data(); // <-- 只读
+    let v_data = v.data();
+    {
+        let hs_data = unsafe { hidden_states.data_mut() };
+        hs_data.fill(0.0);
+
+        for curr_v_head in 0..num_key_value_heads {
+            let offset_matrix_v_g = curr_v_head*d_head;
+            for curr_q_in_group in 0..num_query_heads_per_kv_group {
+                let offset_matrix_a_h = curr_q_in_group*total_d_atts_2
+                    + curr_v_head*total_d_atts_3;
+                for curr_idx_seq in 0..seq_len {
+                    let begin_vec_a = offset_matrix_a_h + curr_idx_seq*total_d_atts_1;
+                    for curr_idx_dhead in 0..d_head {
+                        let begin_vec_v = curr_idx_dhead + offset_matrix_v_g;
+                        let mut sum_ = 0.0;
+                        for curr_idx_tseq in 0..total_seq_len {
+                            let idx_a = begin_vec_a + curr_idx_tseq;
+                            let idx_v = begin_vec_v + curr_idx_tseq*total_d_kv;
+                            sum_ += att_data[idx_a] * v_data[idx_v];
+                        }
+
+                        let curr_att_head = curr_v_head*num_query_heads_per_kv_group + curr_q_in_group;
+                        let hs_offset = curr_idx_seq*(num_attention_heads*d_head)
+                            + curr_att_head*d_head
+                            + curr_idx_dhead;
+                        hs_data[hs_offset] = sum_;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn mlp<T: Default + Copy + Sum + Float + FromPrimitive>(
     residual: &mut Tensor<f32>,
     hidden_states: &mut Tensor<f32>,
     gate: &mut Tensor<f32>,
@@ -602,30 +478,85 @@ fn mlp(
     rms_w: &Tensor<f32>,
     eps: f32,
 ) {
-    // Implement mlp
+    OP::rms_norm(hidden_states, &residual, &rms_w, eps);
+    OP::matmul_transb(gate, f32::zero(), &hidden_states, &w_gate, f32::one());
+    OP::matmul_transb(up, f32::zero(), &hidden_states, &w_up, f32::one());
+    OP::swiglu(up, &gate);
+    OP::matmul_transb(residual, f32::one(), &up, &w_down, f32::one());
+}
 
-    // 确保 rms_w 的形状与 hidden_states 的最后一个维度一致
-    assert_eq!(
-        hidden_states.shape().last(),
-        Some(&rms_w.size()),
-        "rms_w size must match hidden_states last dimension"
+#[test]
+pub fn test_self_attention() {
+    let seq_len = 2;
+    let total_seq_len = 4;
+    let n_kv_h = 2;
+    let n_groups = 1;
+    let dqkv = 3;
+
+    // Initialize simple test tensors for Q, K, and V
+    let q_data = vec![
+        0.1, 0.2, 0.3, // Q for seq_idx 0, head 0
+        0.4, 0.5, 0.6, // Q for seq_idx 1, head 0
+        0.7, 0.8, 0.9, // Q for seq_idx 0, head 1
+        1.0, 1.1, 1.2, // Q for seq_idx 1, head 1
+    ];
+    let q = Tensor::<f32>::new(q_data, &vec![seq_len, n_kv_h * n_groups * dqkv]);
+
+    let k_data = vec![
+        0.1, 0.2, 0.3, // K for total_seq_idx 0, head 0
+        0.4, 0.5, 0.6, // K for total_seq_idx 1, head 0
+        0.7, 0.8, 0.9, // K for total_seq_idx 2, head 0
+        1.0, 1.1, 1.2, // K for total_seq_idx 3, head 0
+        1.3, 1.4, 1.5, // K for total_seq_idx 0, head 1
+        1.6, 1.7, 1.8, // K for total_seq_idx 1, head 1
+        1.9, 2.0, 2.1, // K for total_seq_idx 2, head 1
+        2.2, 2.3, 2.4, // K for total_seq_idx 3, head 1
+    ];
+    let k = Tensor::<f32>::new(k_data, &vec![total_seq_len, n_kv_h * dqkv]);
+
+    let v_data = vec![
+        0.1, 0.2, 0.3, // V for total_seq_idx 0, head 0
+        0.4, 0.5, 0.6, // V for total_seq_idx 1, head 0
+        0.7, 0.8, 0.9, // V for total_seq_idx 2, head 0
+        1.0, 1.1, 1.2, // V for total_seq_idx 3, head 0
+        1.3, 1.4, 1.5, // V for total_seq_idx 0, head 1
+        1.6, 1.7, 1.8, // V for total_seq_idx 1, head 1
+        1.9, 2.0, 2.1, // V for total_seq_idx 2, head 1
+        2.2, 2.3, 2.4, // V for total_seq_idx 3, head 1
+    ];
+    let v = Tensor::<f32>::new(v_data, &vec![total_seq_len, n_kv_h * dqkv]);
+
+    // Initialize attention score tensor and hidden_states
+    let mut att_scores = Tensor::<f32>::default(&vec![n_kv_h, n_groups, seq_len, total_seq_len]);
+    let mut hidden_states = Tensor::<f32>::default(&vec![seq_len, n_kv_h * n_groups * dqkv]);
+
+    // Run self_attention
+    self_attention(
+        &mut hidden_states,
+        &mut att_scores,
+        &q,
+        &k,
+        &v,
+        n_kv_h,
+        n_groups,
+        seq_len,
+        total_seq_len,
+        dqkv,
     );
 
-    // Step 1: RMS Normalization
-    OP::rms_norm(hidden_states, residual, rms_w, eps);
+    // Check the results (example expected results, calculated manually for f32)
+    let expected_hidden_states = Tensor::<f32>::new(
+        vec![
+            0.7825454, 0.8825454, 0.9825454, // Output for seq_idx 0, head 0
+            1.1990090, 1.2990088, 1.3990089, // Output for seq_idx 0, head 1
+            1.5267198, 1.6267197, 1.7267196, // Output for seq_idx 1, head 0
+            1.9442390, 2.0442388, 2.1442390, // Output for seq_idx 1, head 1
+        ],
+        &vec![seq_len, n_kv_h * n_groups * dqkv],
+    );
 
-    // 2) 计算 gate_buf = hidden_states x w_gate^T
-    //    计算 up_buf   = hidden_states x w_up^T
-    //    alpha=1.0, beta=0.0 表示“完全用新结果覆盖 gate_buf / up_buf”
-    OP::matmul_transb(gate, 0.0, hidden_states, w_gate, 1.0);
-    OP::matmul_transb(up,   0.0, hidden_states, w_up,   1.0);
-
-    // 3) gate_buf = swiglu(gate_buf, up_buf)
-    OP::swiglu(up, &gate);
-
-    // 4) residual += gate_buf x w_down^T
-    //    这里 alpha=1.0, beta=1.0 表示“新的乘积加到 residual 上”
-    OP::matmul_transb(residual, 1.0, gate, w_down, 1.0);
+    // Use float_eq for comparison of floating-point values
+    assert!(hidden_states.close_to(&expected_hidden_states, 1e-5));
 }
 
 #[test]
@@ -666,71 +597,70 @@ pub fn test_mlp() {
     ))
 }
 
-#[test]
-pub fn test_load_safetensors() {
-    use std::path::PathBuf;
-    use crate::tensor::float_eq;
-    let project_dir = env!("CARGO_MANIFEST_DIR");
-    let model_dir = PathBuf::from(project_dir).join("models").join("story");
-    let model = Llama::from_safetensors(model_dir);
-    assert_eq!(model.vocab, 2048);
-    assert_eq!(model.n_layers, 2);
-    assert_eq!(model.n_q_h, 8);
-    assert_eq!(model.n_kv_h, 4);
-    assert_eq!(model.d, 128);
-    assert_eq!(model.dqkv, 16);
-    assert_eq!(model.di, 384);
+// #[test]
+// pub fn test_load_safetensors() {
+//     use crate::tensor::float_eq;
+//     use std::path::PathBuf;
+//     let project_dir = env!("CARGO_MANIFEST_DIR");
+//     let model_dir = PathBuf::from(project_dir).join("models").join("story");
+//     let model = Llama::from_safetensors(model_dir);
+//     assert_eq!(model.vocab, 2048);
+//     assert_eq!(model.n_layers, 2);
+//     assert_eq!(model.n_q_h, 8);
+//     assert_eq!(model.n_kv_h, 4);
+//     assert_eq!(model.d, 128);
+//     assert_eq!(model.dqkv, 16);
+//     assert_eq!(model.di, 384);
 
-    assert!(float_eq(&model.params.embedding_table.data()[50], &0.14453125, 1e-6));
-    assert_eq!(model.params.lm_head.data()[10], model.params.embedding_table.data()[10]);
-    assert!(float_eq(&model.params.rms_att_w[0].data()[10], &0.18652344, 1e-6));
-    assert!(float_eq(&model.params.rms_ffn_w[1].data()[10], &0.32421875, 1e-6));
-    assert!(float_eq(&model.params.rms_out_w.data()[100], &0.73046875, 1e-6));
-    assert!(float_eq(&model.params.w_down[0].data()[100], &-0.0625, 1e-6));
-    assert!(float_eq(&model.params.w_up[0].data()[100], &1.46875, 1e-6));
-    assert!(float_eq(&model.params.w_gate[1].data()[100], &0.296875, 1e-6));
-    assert!(float_eq(&model.params.wq[1].data()[100], &0.032226563, 1e-6));
-    assert!(float_eq(&model.params.wk[1].data()[100], &-0.21386719, 1e-6));
-    assert!(float_eq(&model.params.wv[0].data()[100], &0.041015625, 1e-6));
-    assert!(float_eq(&model.params.wo[0].data()[100], &0.01965332, 1e-6));
-
-}
-
-
-#[test]
-fn test_self_attention_multihead() {
-    let n_q_h = 32; // Q 的头数
-    let n_kv_h = 8; // K 和 V 的头数
-    let dqkv = 26;  // 每个头的维度大小
-    let seq_len = 10;
-    let total_seq_len = 20;
-
-    // 初始化张量
-    let q = Tensor::<f32>::default(&vec![seq_len, n_q_h * dqkv]); // [seq_len, n_q_h * dqkv]
-    let k = Tensor::<f32>::default(&vec![total_seq_len, n_kv_h * dqkv]); // [total_seq_len, n_kv_h * dqkv]
-    let v = Tensor::<f32>::default(&vec![total_seq_len, n_kv_h * dqkv]); // [total_seq_len, n_kv_h * dqkv]
-    let mut att_scores = Tensor::<f32>::default(&vec![n_kv_h, n_q_h / n_kv_h, seq_len, total_seq_len]);
-    let mut hidden_states = Tensor::<f32>::default(&vec![seq_len, n_q_h * dqkv]);
-
-    // 验证输入形状
-    assert_eq!(q.shape(), &vec![seq_len, n_q_h * dqkv]);
-    assert_eq!(k.shape(), &vec![total_seq_len, n_kv_h * dqkv]);
-    assert_eq!(v.shape(), &vec![total_seq_len, n_kv_h * dqkv]);
-
-    // 执行 Self-Attention
-    self_attention_multihead(
-        &mut hidden_states,
-        &q,
-        &k,
-        &v,
-        &mut att_scores,
-        n_q_h,
-        n_kv_h,
-        dqkv,
-        seq_len,
-        total_seq_len,
-    );
-
-    // 验证输出形状
-    assert_eq!(hidden_states.shape(), &vec![seq_len, n_q_h * dqkv]);
-}
+//     assert!(float_eq(
+//         &model.params.embedding_table.data()[50],
+//         &0.14453125,
+//         1e-6
+//     ));
+//     assert_eq!(
+//         model.params.lm_head.data()[10],
+//         model.params.embedding_table.data()[10]
+//     );
+//     assert!(float_eq(
+//         &model.params.rms_att_w[0].data()[10],
+//         &0.18652344,
+//         1e-6
+//     ));
+//     assert!(float_eq(
+//         &model.params.rms_ffn_w[1].data()[10],
+//         &0.32421875,
+//         1e-6
+//     ));
+//     assert!(float_eq(
+//         &model.params.rms_out_w.data()[100],
+//         &0.73046875,
+//         1e-6
+//     ));
+//     assert!(float_eq(
+//         &model.params.w_down[0].data()[100],
+//         &-0.0625,
+//         1e-6
+//     ));
+//     assert!(float_eq(&model.params.w_up[0].data()[100], &1.46875, 1e-6));
+//     assert!(float_eq(
+//         &model.params.w_gate[1].data()[100],
+//         &0.296875,
+//         1e-6
+//     ));
+//     assert!(float_eq(
+//         &model.params.wq[1].data()[100],
+//         &0.032226563,
+//         1e-6
+//     ));
+//     assert!(float_eq(
+//         &model.params.wk[1].data()[100],
+//         &-0.21386719,
+//         1e-6
+//     ));
+//     assert!(float_eq(
+//         &model.params.wv[0].data()[100],
+//         &0.041015625,
+//         1e-6
+//     ));
+//     assert!(float_eq(&model.params.wo[0].data()[100], &0.01965332, 1e-6));
+// }

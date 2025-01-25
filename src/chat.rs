@@ -155,7 +155,7 @@ impl ChatAI {
         let response_tokens = self.llama.streaming_generate(
             &input_ids,
             128,  // max_len, 可以视需要调整
-            0.9,  // top_p
+            0.7,  // top_p
             30,   // top_k
             1.0,  // temperature, 可再调低些
             &mut self.kvcache,
@@ -165,23 +165,23 @@ impl ChatAI {
         let mut generated_tokens = vec![];
         let mut response_text = String::new();
 
+        print!("\rAssistant: \n", );
         for token in response_tokens {
             generated_tokens.push(token);
 
-            // 解码**单个 token** 或全部 token，都可以
-            // let token_str = self.tokenizer.decode(&[token], true).unwrap()+ " ";
+            let token_str = self.tokenizer.decode(&[token], true).unwrap()+ " ";
 
-            // response_text.push_str(&token_str);
+            response_text.push_str(&token_str);
             // Decode the generated tokens so far
-            let partial_response = self.tokenizer
-                .decode(&generated_tokens, true)
-                .unwrap()
-                .trim()
-                .to_string();
+            // let partial_response = self.tokenizer
+            //     .decode(&generated_tokens, true)
+            //     .unwrap()
+            //     .trim()
+            //     .to_string();
             // 流式打印
-            print!("\rAssistant: {}", partial_response);
+            // print!("\rAssistant: {}", partial_response);
             // let word = tokenizer.decode(&[token], true).unwrap() + " ";
-            // print!("{}", token_str);
+            print!("{}", token_str);
             std::io::stdout().flush().unwrap();
 
             // 如果是 EOS，就 break
