@@ -18,6 +18,8 @@ use std::iter::Sum;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 use tokio::runtime::Runtime;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use crate::params::FromLeBytes;
 
 fn story_mode() {
@@ -94,7 +96,20 @@ where
     }
 }
 
+pub fn init_log() {
+    tracing_subscriber::registry()
+        // .with(tracing_subscriber::filter::LevelFilter::INFO)
+        // completes the builder.
+        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::filter::EnvFilter::builder()
+            .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+            .from_env_lossy())
+        // sets this to be the default, global collector for this application.
+        .init();
+}
+
 fn main() {
+    init_log();
     println!("Choose a mode: \n1. Story Mode\n2. Chat Mode\n3. Start API Server");
     print!("Enter your choice (1, 2, or 3): ");
     io::stdout().flush().unwrap();

@@ -10,23 +10,24 @@ use half::{bf16, f16};
 use num_traits::{Float, FromPrimitive};
 use crate::params::FromLeBytes;
 
-struct Message {
-    role: String,
-    content: String,
+#[derive(Clone)]
+pub struct Message {
+    pub(crate) role: String,
+    pub(crate) content: String,
 }
 
 impl Message {
-    fn format(&self) -> String {
+    pub(crate) fn format(&self) -> String {
         format!("<|im_start|>{}\n{}<|im_end|>\n", self.role, self.content)
     }
 }
 
 /// **ChatAI 结构体（支持泛型）**
 pub struct ChatAI<T> {
-    llama: model::Llama<T>,
-    tokenizer: Tokenizer,
-    kvcache: KVCache<T>,
-    messages: Vec<Message>,
+    pub(crate) llama: model::Llama<T>,
+    pub(crate) tokenizer: Tokenizer,
+    pub(crate) kvcache: KVCache<T>,
+    pub(crate) messages: Vec<Message>,
 }
 
 impl<T> ChatAI<T>
@@ -56,7 +57,7 @@ where
     }
 
     /// **构造 Prompt**
-    fn build_prompt(&self, add_generation_prompt: bool) -> String {
+    pub(crate) fn build_prompt(&self, add_generation_prompt: bool) -> String {
         let mut prompt = String::new();
         self.messages.first().map(|msg| {
             prompt.push_str(&msg.format());
