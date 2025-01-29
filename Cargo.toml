@@ -10,3 +10,4 @@ safetensors = "0.4.3"
 tokenizers = "0.19.1"
 rand = "0.8"
 num-traits = "0.2.19"
+half = { version = "2.4.1", features = ["num-traits"] }

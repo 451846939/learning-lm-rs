@@ -1,7 +1,28 @@
-use core::f32;
 use crate::config::LlamaConfigJson;
 use crate::tensor::Tensor;
+use core::f32;
+use half::{bf16, f16};
 use safetensors::{Dtype, SafeTensors};
+
+pub trait FromLeBytes: Sized {
+    fn from_le_bytes(bytes: &[u8]) -> Self;
+}
+impl FromLeBytes for f32 {
+    fn from_le_bytes(bytes: &[u8]) -> Self {
+        f32::from_le_bytes(bytes.try_into().expect("Invalid byte length for f32"))
+    }
+}
+impl FromLeBytes for f16 {
+    fn from_le_bytes(bytes: &[u8]) -> Self {
+        f16::from_le_bytes([bytes[0], bytes[1]])
+    }
+}
+impl FromLeBytes for bf16 {
+    fn from_le_bytes(bytes: &[u8]) -> Self {
+        bf16::from_le_bytes([bytes[0], bytes[1]])
+    }
+}
+
 pub struct LLamaParams<T> {
     // token_id to embedding lookup table
     pub embedding_table: Tensor<T>, // (vocab_size, dim)
@@ -21,12 +42,12 @@ pub struct LLamaParams<T> {
     pub lm_head: Tensor<T>,   // (vocab_size, dim)
 }
 
-impl LLamaParams<f32> {
+impl<T: Copy + Clone + Default + FromLeBytes> LLamaParams<T> {
     pub fn from_safetensors(safetensor: &SafeTensors, config: &LlamaConfigJson) -> Self {
         // 打印 safetensors 中所有可用的张量名称
         println!("Available tensors: {:?}", safetensor.names());
 
-        let get_tensor = |name: &str| -> Tensor<f32> {
+        let get_tensor = |name: &str| -> Tensor<T> {
             let tensor_view = safetensor
                 .tensor(name)
                 .unwrap_or_else(|_| panic!("Tensor `{}` not found in safetensors", name));
@@ -35,15 +56,15 @@ impl LLamaParams<f32> {
             let data = tensor_view
                 .data()
                 .chunks_exact(element_size)
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-                .collect::<Vec<f32>>();
+                .map(|chunk| T::from_le_bytes(chunk.try_into().unwrap()))
+                .collect::<Vec<T>>();
             let shape = tensor_view.shape().to_vec();
-            Tensor::<f32>::new(data, &shape)
+            Tensor::<T>::new(data, &shape)
         };
 
         let n_layers = config.num_hidden_layers;
 
-        let embedding_table=if config.tie_word_embeddings {
+        let embedding_table = if config.tie_word_embeddings {
             get_tensor("lm_head.weight")
         } else {
             get_tensor("model.embed_tokens.weight")
