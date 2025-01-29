@@ -11,3 +11,7 @@ tokenizers = "0.19.1"
 rand = "0.8"
 num-traits = "0.2.19"
 half = { version = "2.4.1", features = ["num-traits"] }
+tokio = { version = "1.6.0", features = ["full"] }
+axum = { version = "0.7.5"}
+axum-extra = { version = "0.9.3", features = ["typed-header"] }
+log = "0.4.22"

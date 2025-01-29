@@ -7,6 +7,7 @@ mod model;
 mod operators;
 mod params;
 mod tensor;
+mod server;
 
 use crate::chat::ChatAI;
 use crate::config::{LlamaConfigJson, TorchDType};
@@ -16,6 +17,7 @@ use std::io::{self, Write};
 use std::iter::Sum;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
+use tokio::runtime::Runtime;
 use crate::params::FromLeBytes;
 
 fn story_mode() {
@@ -93,8 +95,8 @@ where
 }
 
 fn main() {
-    println!("Choose a mode: \n1. Story Mode\n2. Chat Mode\n");
-    print!("Enter your choice (1 or 2): ");
+    println!("Choose a mode: \n1. Story Mode\n2. Chat Mode\n3. Start API Server");
+    print!("Enter your choice (1, 2, or 3): ");
     io::stdout().flush().unwrap();
 
     let mut choice = String::new();
@@ -104,6 +106,11 @@ fn main() {
     match choice {
         "1" => story_mode(),
         "2" => chat_mode(),
-        _ => println!("Invalid choice! Please restart and enter 1 or 2."),
+        "3" => {
+            println!("Starting API Server...");
+            let rt = Runtime::new().unwrap();
+            rt.block_on(server::start_server());
+        }
+        _ => println!("Invalid choice! Please restart and enter 1, 2, or 3."),
     }
 }
